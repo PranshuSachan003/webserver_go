@@ -2,23 +2,46 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 var db *pgxpool.Pool
 
+var ctx = context.Background()
+
+func connectRedis() *redis.Client {
+	// Connect to Redis at localhost:6379 (Docker)
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379", // Redis address
+		Password: "",               // No password set
+		DB:       0,                // Use default DB
+	})
+
+	// Test connection
+	pong, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Could not connect to Redis: %v", err)
+	}
+
+	fmt.Printf("Redis connected: %s\n", pong)
+	return rdb
+}
+
 func main() {
 	var err error
-	db, err = pgxpool.New(context.Background(), "postgres://root:secret@localhost:5432/root")
+	db, err = pgxpool.New(ctx, "postgres://root:secret@localhost:5432/root")
 	if err != nil {
 		fmt.Println("Unable to connect to database:", err)
 	}
@@ -39,22 +62,51 @@ func main() {
 }
 
 func getUser(c *gin.Context) {
-	rows, err := db.Query(context.Background(), "select * from users")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error ": err.Error()})
-	}
-	defer rows.Close()
-
+	redis := connectRedis()
 	users := []map[string]interface{}{}
-	for rows.Next() {
-		var id int
-		var name string
-		var age int
-		if err := rows.Scan(&id, &name, &id); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+	var retrievedUsers []map[string]interface{}
+
+	value, err := redis.Get(ctx, "AllUsers").Result()
+	if err != nil {
+		fmt.Println("could not get value from the AllUsers key", err)
+	} else {
+		err = json.Unmarshal([]byte(value), &retrievedUsers)
+		if err != nil {
+			fmt.Println("Could not unmarshal data:", err)
 		}
-		users = append(users, map[string]interface{}{"id": id, "name": name, "age": age})
+		fmt.Println("retrievedUsers is ", retrievedUsers)
+	}
+	if len(retrievedUsers) != 0 {
+		users = retrievedUsers
+	}
+
+	if len(users) == 0 {
+		rows, err := db.Query(ctx, "select * from users")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error ": err.Error()})
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var id int
+			var name string
+			var age int
+			if err := rows.Scan(&id, &name, &age); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			users = append(users, map[string]interface{}{"id": id, "name": name, "age": age})
+		}
+
+		allUsers, err := json.Marshal(users)
+		fmt.Println("allUsers is ", string(allUsers))
+		if err != nil {
+			fmt.Println("Could not marshal data", err)
+		}
+		err = redis.Set(ctx, "AllUsers", string(allUsers), 10*time.Minute).Err()
+		if err != nil {
+			fmt.Println("could not set the AllUsers key", err)
+		}
 	}
 
 	c.JSON(http.StatusOK, users)
@@ -62,7 +114,7 @@ func getUser(c *gin.Context) {
 
 func getUserById(c *gin.Context) {
 	id := c.Param("id")
-	row := db.QueryRow(context.Background(), "select * from users where id = $1", id)
+	row := db.QueryRow(ctx, "select * from users where id = $1", id)
 
 	var user struct {
 		UserId int    `json:"id"`
@@ -94,7 +146,7 @@ func createUser(c *gin.Context) {
 		return
 	}
 	fmt.Println(user.Name, user.Age)
-	_, err := db.Exec(context.Background(), "INSERT INTO users (name, age) VALUES ($1, $2)", user.Name, user.Age)
+	_, err := db.Exec(ctx, "INSERT INTO users (name, age) VALUES ($1, $2)", user.Name, user.Age)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -151,7 +203,7 @@ func updateUser(c *gin.Context) {
 
 	// Execute the update query
 	query := "UPDATE users SET name = $1, age = $2 WHERE id = $3"
-	result, err := db.Exec(context.Background(), query, updateData.Name, updateData.Age, id)
+	result, err := db.Exec(ctx, query, updateData.Name, updateData.Age, id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -173,7 +225,7 @@ func deleteUser(c *gin.Context) {
 
 	// Execute the delete query
 	query := "DELETE FROM users WHERE id = $1"
-	result, err := db.Exec(context.Background(), query, id)
+	result, err := db.Exec(ctx, query, id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
