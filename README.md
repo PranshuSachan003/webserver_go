@@ -1,1 +1,1 @@
-Web server using pg and gin
+Web server using gin, pg and redis
